@@ -52,6 +52,13 @@ private struct WireFixture: Codable {
   let unknown = fixture.replacingOccurrences(
     of: "\"type\": \"value\"", with: "\"type\": \"future\"")
   #expect(try JSONDecoder().decode(WireFixture.self, from: Data(unknown.utf8)).updates.put.isEmpty)
+  let futureStatus = fixture.replacingOccurrences(
+    of: "\"status\": \"rejected\"", with: "\"status\": \"future\"")
+  let future = try JSONDecoder().decode(WireFixture.self, from: Data(futureStatus.utf8))
+  #expect(future.updates.rejections.first?.status == .unknown("future"))
+  #expect(
+    try JSONSerialization.jsonObject(with: JSONEncoder().encode(future)) as? NSDictionary
+      == JSONSerialization.jsonObject(with: Data(futureStatus.utf8)) as? NSDictionary)
   let corrupt = fixture.replacingOccurrences(
     of: "\"type\": \"value\", \"key\": \"counter\", \"value\": 4",
     with: "\"type\": \"value\", \"key\": \"counter\", \"value\": \"invalid\"")

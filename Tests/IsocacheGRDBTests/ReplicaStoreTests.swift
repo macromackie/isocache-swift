@@ -29,7 +29,9 @@ private struct Record: Codable, Sendable {
 private typealias Store = ReplicaStore<Edit, Record>
 private enum Failure: Error { case interrupted }
 
-private func open(_ path: String = ":memory:", account: String = "account") throws -> Store {
+private func open(_ path: String = ":memory:", account: String = "account") throws -> (
+  store: Store, database: DatabaseQueue
+) {
   let database = try DatabaseQueue(path: path)
   var migrator = DatabaseMigrator()
   migrator.registerMigration("records") { db in
@@ -42,7 +44,7 @@ private func open(_ path: String = ":memory:", account: String = "account") thro
   }
   Store.registerMigrations(in: &migrator)
   try migrator.migrate(database)
-  return try Store(
+  let store = try Store(
     database: database, accountID: account,
     adapter: ReplicaAdapter(
       clearRemote: { try $0.execute(sql: "DELETE FROM remote") },
@@ -63,10 +65,11 @@ private func open(_ path: String = ":memory:", account: String = "account") thro
         if command.key == "fail" { throw Failure.interrupted }
       }
     ))
+  return (store, database)
 }
 
-private func values(_ store: Store) throws -> [String: Int] {
-  try store.database.read { db in
+private func values(_ database: DatabaseQueue) throws -> [String: Int] {
+  try database.read { db in
     Dictionary(
       uniqueKeysWithValues: try Row.fetchAll(db, sql: "SELECT * FROM local").map {
         ($0["key"], $0["value"])
@@ -75,9 +78,9 @@ private func values(_ store: Store) throws -> [String: Int] {
 }
 
 @Test func enqueueRollsBackProjectionAndSequenceAndCapturesIdentityInTheTransaction() throws {
-  let store = try open()
+  let (store, database) = try open()
   #expect(throws: Failure.self) { try store.enqueue(Edit(key: "fail", value: 1)) }
-  #expect(try values(store).isEmpty)
+  #expect(try values(database).isEmpty)
   #expect(try store.status().pendingCount == 0)
   let first = try store.enqueue(Edit(key: "a", value: 2))
   let second = try store.enqueue { db, context in
@@ -88,7 +91,7 @@ private func values(_ store: Store) throws -> [String: Int] {
   }
   #expect(first.sequence == 1)
   #expect(
-    try store.database.read {
+    try database.read {
       try String.fetchOne($0, sql: "SELECT edit_id FROM local WHERE key = 'a'")
     } == second.id)
 }
@@ -102,38 +105,38 @@ private func values(_ store: Store) throws -> [String: Int] {
   let pending: Isocache.Operation<Edit>
   let client: String
   do {
-    let store = try open(path)
+    let (store, _) = try open(path)
     try store.reconcile(Updates(cookie: "high", order: 9, lastSequence: 0))
     sent = try store.enqueue(Edit(key: "a", value: 1))
     pending = try store.enqueue(Edit(key: "b", value: 2))
     client = try store.requests().0.clientID
     try store.markSent(through: sent.sequence)
   }
-  let reopened = try open(path)
+  let (reopened, database) = try open(path)
   #expect(throws: ReplicaError.accountMismatch) { try open(path, account: "other") }
   #expect(try reopened.requests().0.clientID == client)
   #expect(try reopened.requests().0.operations == [pending])
   try reopened.reconcile(Updates(cookie: "reset", order: 1, clear: true, lastSequence: 0))
-  #expect(try values(reopened) == ["a": 1, "b": 2])
+  #expect(try values(database) == ["a": 1, "b": 2])
   try reopened.reconcile(
     Updates(
       cookie: "confirmed", order: 2, lastSequence: 1,
       rejections: [Receipt(sequence: 1, error: "Changed elsewhere", id: sent.id, code: "conflict")])
   )
-  #expect(try values(reopened) == ["b": 2])
+  #expect(try values(database) == ["b": 2])
   let rejection = try #require(reopened.rejections().first)
-  #expect(rejection.operation == sent && rejection.code == "conflict")
+  #expect(try rejection.decodeOperation() == sent && rejection.code == "conflict")
   #expect(try reopened.status().pendingCount == 1)
   #expect(try !reopened.reconcile(Updates(cookie: "stale", order: 1, lastSequence: 1)))
   #expect(try reopened.requests().1.cookie == "confirmed")
   try reopened.deleteAccountData()
-  #expect(try values(reopened).isEmpty)
+  #expect(try values(database).isEmpty)
   #expect(try reopened.requests().0.clientID != client)
   #expect(try reopened.rejections().isEmpty)
 }
 
 @Test func failedReconciliationRollsBackReplicaCookieAndAcknowledgement() throws {
-  let store = try open()
+  let (store, database) = try open()
   let operation = try store.enqueue(Edit(key: "a", value: 1))
   #expect(throws: Failure.self) {
     try store.reconcile(
@@ -142,13 +145,23 @@ private func values(_ store: Store) throws -> [String: Int] {
       throw Failure.interrupted
     }
   }
+  #expect(throws: ReplicaError.unsupportedOutcome("future")) {
+    try store.reconcile(
+      Updates(
+        cookie: "future", order: 1, lastSequence: operation.sequence,
+        rejections: [
+          Receipt(
+            sequence: operation.sequence, error: nil,
+            status: .unknown("future"))
+        ]))
+  }
   #expect(try store.requests().0.operations == [operation])
   #expect(try store.requests().1.cookie == nil)
-  #expect(try values(store) == ["a": 1])
+  #expect(try values(database) == ["a": 1])
 }
 
 @Test func successfulPushAndFailedPullKeepOptimisticWorkUntilConfirmation() async throws {
-  let store = try open()
+  let (store, database) = try open()
   let operation = try store.enqueue(Edit(key: "a", value: 8))
   let pulls = Mutex(0)
   let coordinator = SyncCoordinator(
@@ -170,10 +183,69 @@ private func values(_ store: Store) throws -> [String: Int] {
       }
     ))
   await #expect(throws: Failure.self) { try await coordinator.sync() }
-  #expect(try values(store) == ["a": 8])
+  #expect(try values(database) == ["a": 8])
   #expect(try store.status().pendingCount == 1)
   #expect(try store.requests().0.operations.isEmpty)
   #expect(try await coordinator.sync())
   #expect(try store.status().pendingCount == 0)
-  #expect(try values(store) == ["a": 8])
+  #expect(try values(database) == ["a": 8])
+}
+
+@Test func conflictResolutionRollsBackDismissalWhenTheReplacementCannotBeApplied() throws {
+  let (store, database) = try open()
+  let original = try store.enqueue(Edit(key: "a", value: 1))
+  try store.reconcile(
+    Updates(
+      cookie: "rejected", order: 1, lastSequence: original.sequence,
+      rejections: [
+        Receipt(
+          sequence: original.sequence, error: "Conflict", id: original.id,
+          code: "conflict", status: .rejected)
+      ]))
+  #expect(throws: Failure.self) {
+    try store.resolveRejections { _, _, failures in
+      .retry(Edit(key: "fail", value: 2), dismissing: failures.map { $0.failure.id })
+    }
+  }
+  #expect(try store.rejections().map { try $0.decodeOperation() } == [original])
+  #expect(try store.status().pendingCount == 0)
+  #expect(try values(database).isEmpty)
+  try store.resolveRejections { _, _, failures in
+    .retry(Edit(key: "a", value: 3), dismissing: failures.map { $0.failure.id })
+  }
+  let replacement = try #require(store.requests().0.operations.first)
+  #expect(replacement.sequence == original.sequence + 1)
+  #expect(replacement.id != original.id)
+  #expect(try store.rejections().isEmpty)
+  #expect(try values(database) == ["a": 3])
+}
+
+@Test func historicalFailureCanBeDismissedWithoutBlockingKnownConflictRecovery() throws {
+  let (store, database) = try open()
+  let historical = try store.enqueue(Edit(key: "old", value: 1))
+  let conflict = try store.enqueue(Edit(key: "current", value: 2))
+  try store.reconcile(
+    Updates(
+      cookie: "failed", order: 1, lastSequence: conflict.sequence,
+      rejections: [
+        Receipt(sequence: historical.sequence, error: "Historical failure", id: historical.id),
+        Receipt(sequence: conflict.sequence, error: "Conflict", id: conflict.id, code: "conflict"),
+      ]))
+  try database.write { db in
+    try db.execute(
+      sql: "UPDATE sync_operations SET name = 'unknown', args = '{}' WHERE id = ?",
+      arguments: [historical.id])
+  }
+  let metadata = try store.metadata()
+  #expect(metadata.failures.map(\.id) == [historical.id, conflict.id])
+  try store.resolveRejections { _, _, failures in
+    let known = try #require(failures.first { $0.code == "conflict" })
+    let command = try known.decodeOperation().command
+    return .retry(command, dismissing: [known.failure.id])
+  }
+  #expect(try values(database) == ["current": 2])
+  #expect(try store.metadata().failures.map(\.id) == [historical.id])
+  try store.dismissRejections(ids: [historical.id])
+  #expect(try store.metadata().failures.isEmpty)
+  #expect(try store.requests().0.operations.first?.sequence == conflict.sequence + 1)
 }

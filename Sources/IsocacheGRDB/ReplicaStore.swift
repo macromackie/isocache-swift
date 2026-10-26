@@ -2,28 +2,9 @@ import Foundation
 import GRDB
 import Isocache
 
-public enum ReplicaError: Error, Equatable, Sendable {
-  case accountMismatch
-  case invalidUpdate
-}
-
-public struct RejectedOperation<Command: SyncCommand>: Sendable {
-  public let operation: Isocache.Operation<Command>
-  public let error: String?
-  public let code: String?
-  public let status: String?
-}
-
-public struct SyncStatus: Equatable, Sendable {
-  public let pendingCount: Int
-  public let rejectedCount: Int
-  public let lastConfirmedSequence: Int
-  public let hasSynced: Bool
-}
-
 public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable>: Sendable {
-  public let accountID: String
-  public let database: DatabaseQueue
+  private let accountID: String
+  private let database: DatabaseQueue
   private let adapter: ReplicaAdapter<Command, Entity>
   private let schema: Int
 
@@ -79,23 +60,14 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
     -> Isocache.Operation<Command>
   {
     try database.write { db in
-      let state = try Row.fetchOne(db, sql: "SELECT client_id, next_sequence FROM sync_state")!
-      let context = OperationContext(
-        accountID: accountID, clientID: state["client_id"],
-        id: UUID().uuidString.lowercased(), sequence: state["next_sequence"])
-      let command = try prepare(db, context)
-      let operation = Isocache.Operation(
-        id: context.id, sequence: context.sequence, command: command)
-      try Self.insert(operation, into: db)
-      try db.execute(sql: "UPDATE sync_state SET next_sequence = next_sequence + 1")
-      try adapter.apply(db, context, command)
-      return operation
+      let context = try nextOperationContext(in: db)
+      return try append(prepare(db, context), context: context, to: db)
     }
   }
 
   public func requests() throws -> (OperationsRequest<Command>, UpdatesRequest) {
     try database.read { db in
-      let state = try Row.fetchOne(db, sql: "SELECT client_id, cookie FROM sync_state")!
+      let state = try Self.requireState(db)
       return (
         OperationsRequest(
           clientID: state["client_id"], operations: try Self.operations(db, statuses: ["pending"])),
@@ -120,7 +92,7 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
     additionalChanges: (Database) throws -> Void = { _ in }
   ) throws -> Bool {
     try database.write { db in
-      let state = try Row.fetchOne(db, sql: "SELECT * FROM sync_state")!
+      let state = try Self.requireState(db)
       let confirmed: Int = state["last_confirmed_sequence"]
       let next: Int = state["next_sequence"]
       guard updates.version == 2, updates.lastSequence >= confirmed, updates.lastSequence < next
@@ -133,20 +105,29 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
       for key in updates.del { try adapter.remove(db, key) }
       for put in updates.put { try adapter.upsert(db, put) }
 
-      let receipts = Dictionary(
-        updates.rejections.map { ($0.sequence, $0) }, uniquingKeysWith: { first, _ in first })
+      var receipts: [Int: Receipt] = [:]
+      for receipt in updates.rejections {
+        guard receipts[receipt.sequence] == nil, receipt.sequence > 0,
+          receipt.sequence <= updates.lastSequence
+        else { throw ReplicaError.invalidUpdate }
+        if case .unknown(let value) = receipt.status {
+          throw ReplicaError.unsupportedOutcome(value)
+        }
+        receipts[receipt.sequence] = receipt
+      }
       for operation in try Self.operations(db, statuses: ["pending", "sent"])
       where operation.sequence <= updates.lastSequence {
         if let receipt = receipts[operation.sequence],
-          receipt.error != nil || receipt.code != nil || receipt.status == "rejected"
-            || receipt.status == "appliedWithNotice"
+          receipt.error != nil || receipt.code != nil || receipt.status == .rejected
+            || receipt.status == .appliedWithNotice
         {
           if let id = receipt.id, id != operation.id { throw ReplicaError.invalidUpdate }
           try db.execute(
             sql: """
               UPDATE sync_operations SET status = 'rejected', error = ?, error_code = ?, outcome_status = ?
               WHERE sequence = ?
-              """, arguments: [receipt.error, receipt.code, receipt.status, operation.sequence])
+              """,
+            arguments: [receipt.error, receipt.code, receipt.status?.rawValue, operation.sequence])
         } else {
           try db.execute(
             sql: "DELETE FROM sync_operations WHERE sequence = ?", arguments: [operation.sequence])
@@ -164,29 +145,93 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
   }
 
   public func rejections() throws -> [RejectedOperation<Command>] {
-    try database.read(Self.rejections)
+    try database.read { try Self.rejections(in: $0) }
   }
 
-  public static func rejections(_ db: Database) throws -> [RejectedOperation<Command>] {
+  public static func rejections(in db: Database) throws -> [RejectedOperation<Command>] {
     try Row.fetchAll(
       db, sql: "SELECT * FROM sync_operations WHERE status = 'rejected' ORDER BY sequence"
     )
     .map { row in
-      RejectedOperation(
-        operation: try Self.operation(row), error: row["error"],
-        code: row["error_code"], status: row["outcome_status"])
+      let failure = Self.failure(row)
+      let name: String = row["name"]
+      let arguments = Data((row["args"] as String).utf8)
+      return RejectedOperation(failure: failure) {
+        try Self.operation(
+          id: failure.id, sequence: failure.sequence, name: name, arguments: arguments)
+      }
+    }
+  }
+
+  public func resolveRejections(
+    _ prepare: (Database, OperationContext, [RejectedOperation<Command>]) throws ->
+      RejectionResolution<Command>
+  ) throws {
+    try database.write { db in
+      let failures = try Self.rejections(in: db)
+      let context = try nextOperationContext(in: db)
+      let resolution = try prepare(db, context, failures)
+      switch resolution {
+      case .dismiss(let ids):
+        try Self.dismiss(ids, from: failures.map(\.failure), in: db)
+      case .retry(let command, let ids):
+        try Self.dismiss(ids, from: failures.map(\.failure), in: db)
+        _ = try append(command, context: context, to: db)
+      }
     }
   }
 
   public func dismissRejections(ids: [String]) throws {
-    try database.write { try Self.dismissRejections(ids: ids, in: $0) }
+    try database.write { db in
+      try Self.dismiss(ids, from: Self.metadata(in: db).failures, in: db)
+    }
   }
 
-  public static func dismissRejections(ids: [String], in db: Database) throws {
+  private func nextOperationContext(in db: Database) throws -> OperationContext {
+    let state = try Self.requireState(db)
+    return OperationContext(
+      accountID: accountID, clientID: state["client_id"],
+      id: UUID().uuidString.lowercased(), sequence: state["next_sequence"])
+  }
+
+  private func append(_ command: Command, context: OperationContext, to db: Database) throws
+    -> Isocache.Operation<Command>
+  {
+    let operation = Isocache.Operation(id: context.id, sequence: context.sequence, command: command)
+    try Self.insert(operation, into: db)
+    try db.execute(sql: "UPDATE sync_state SET next_sequence = next_sequence + 1")
+    try adapter.apply(db, context, command)
+    return operation
+  }
+
+  private static func dismiss(
+    _ ids: [String], from failures: [OperationFailure], in db: Database
+  ) throws {
+    let available = Set(failures.map(\.id))
+    guard !ids.isEmpty, Set(ids).count == ids.count, Set(ids).isSubset(of: available)
+    else { throw ReplicaError.invalidResolution }
     for id in ids {
       try db.execute(
         sql: "DELETE FROM sync_operations WHERE id = ? AND status = 'rejected'", arguments: [id])
     }
+  }
+
+  public func metadata() throws -> ReplicaMetadata { try database.read(Self.metadata) }
+
+  public static func metadata(in db: Database) throws -> ReplicaMetadata {
+    let rows = try Row.fetchAll(
+      db,
+      sql:
+        "SELECT id, sequence, error, error_code, outcome_status FROM sync_operations WHERE status = 'rejected' ORDER BY sequence"
+    )
+    return ReplicaMetadata(status: try Self.status(db), failures: rows.map(Self.failure))
+  }
+
+  private static func failure(_ row: Row) -> OperationFailure {
+    let status: String? = row["outcome_status"]
+    return OperationFailure(
+      id: row["id"], sequence: row["sequence"], message: row["error"],
+      code: row["error_code"], status: status.map(ReceiptStatus.init(rawValue:)))
   }
 
   public func status() throws -> SyncStatus { try database.read(Self.status) }
@@ -225,16 +270,17 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
     try database.writeWithoutTransaction { db in try db.execute(sql: "VACUUM") }
   }
 
-  public func rebase(_ db: Database) throws {
+  private func rebase(_ db: Database) throws {
     try Self.rebase(db, adapter: adapter)
   }
 
-  public static func rebase(_ db: Database, adapter: ReplicaAdapter<Command, Entity>) throws {
+  private static func rebase(_ db: Database, adapter: ReplicaAdapter<Command, Entity>) throws {
     try adapter.resetLocal(db)
     let operations = try Self.operations(db, statuses: ["pending", "sent"])
     guard !operations.isEmpty else { return }
-    let accountID = try String.fetchOne(db, sql: "SELECT account FROM sync_state")!
-    let clientID = try String.fetchOne(db, sql: "SELECT client_id FROM sync_state")!
+    let state = try requireState(db)
+    let accountID: String = state["account"]
+    let clientID: String = state["client_id"]
     for operation in operations {
       try adapter.apply(
         db,
@@ -244,7 +290,7 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
     }
   }
 
-  public static func insert(
+  private static func insert(
     _ operation: Isocache.Operation<Command>, queuedAt: Date = Date(), into db: Database
   ) throws {
     let encoder = JSONEncoder()
@@ -261,7 +307,7 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
       ])
   }
 
-  public static func operations(_ db: Database, statuses: [String]) throws -> [Isocache.Operation<
+  private static func operations(_ db: Database, statuses: [String]) throws -> [Isocache.Operation<
     Command
   >] {
     try Row.fetchAll(
@@ -274,16 +320,28 @@ public final class ReplicaStore<Command: SyncCommand, Entity: Codable & Sendable
   }
 
   private static func operation(_ row: Row) throws -> Isocache.Operation<Command> {
-    let decoder = JSONDecoder()
-    decoder.userInfo[commandNameKey] = row["name"] as String
-    let command = try decoder.decode(
-      CommandArguments<Command>.self, from: Data((row["args"] as String).utf8)
-    ).command
-    return Isocache.Operation(id: row["id"], sequence: row["sequence"], command: command)
+    try operation(
+      id: row["id"], sequence: row["sequence"], name: row["name"],
+      arguments: Data((row["args"] as String).utf8))
   }
 
-  public static func status(_ db: Database) throws -> SyncStatus {
-    let state = try Row.fetchOne(db, sql: "SELECT cookie, last_confirmed_sequence FROM sync_state")!
+  private static func operation(
+    id: String, sequence: Int, name: String, arguments: Data
+  ) throws -> Isocache.Operation<Command> {
+    let decoder = JSONDecoder()
+    decoder.userInfo[commandNameKey] = name
+    let command = try decoder.decode(CommandArguments<Command>.self, from: arguments).command
+    return Isocache.Operation(id: id, sequence: sequence, command: command)
+  }
+
+  private static func requireState(_ db: Database) throws -> Row {
+    guard let row = try Row.fetchOne(db, sql: "SELECT * FROM sync_state WHERE id = 1")
+    else { throw ReplicaError.missingState }
+    return row
+  }
+
+  private static func status(_ db: Database) throws -> SyncStatus {
+    let state = try requireState(db)
     return SyncStatus(
       pendingCount: try Int.fetchOne(
         db, sql: "SELECT COUNT(*) FROM sync_operations WHERE status IN ('pending', 'sent')")!,

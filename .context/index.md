@@ -11,3 +11,10 @@ and recovery. See the [synchronization contract](../.contracts/001-synchronizati
 
 Keep domain conflict decisions in the consuming app. Keep shared wire fixtures under `Tests/IsocacheTests/Fixtures`.
 The package currently exposes two runtime products; application-specific headless drivers stay with their apps.
+
+The application retains its DatabaseQueue for domain data. ReplicaStore exposes typed metadata, observation and
+atomic rejection recovery rather than its database or queue insertion/rebase internals. `ReceiptStatus` preserves
+an unknown wire value at decoding and rejects it atomically during reconciliation. `SyncFailure` reports connection
+and refresh failures while account scope and the foreground caller still own cancellation. The separate
+[wire](../.contracts/002-wire/CONTRACT.md) and [session lifecycle](../.contracts/003-session-lifecycle/CONTRACT.md)
+contracts keep those decisions reviewable. [Guidance adoption](../.agents/guidance-adoption.md) records the shared baseline.

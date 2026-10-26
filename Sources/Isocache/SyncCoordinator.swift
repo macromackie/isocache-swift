@@ -33,11 +33,29 @@ public struct SyncTransport<Command: SyncCommand, Response: Sendable>: Sendable 
   }
 }
 
+public struct SyncFailure: Sendable {
+  public enum Phase: Equatable, Sendable {
+    case connecting
+    case refreshing
+    case receiving
+    case retrying
+  }
+
+  public let phase: Phase
+  public let error: any Error
+
+  public init(phase: Phase, error: any Error) {
+    self.phase = phase
+    self.error = error
+  }
+}
+
 /// A coordinator is bound to one store and one authenticated session for its entire lifetime.
 public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
   private let storage: SyncStorage<Command, Response>
   private let transport: SyncTransport<Command, Response>
   private let didSync: @Sendable () async -> Void
+  private let onFailure: @Sendable (SyncFailure) async -> Void
   private let sleep: @Sendable (Duration) async throws -> Void
   private let now: @Sendable () -> ContinuousClock.Instant
   private nonisolated let scope = SessionScope()
@@ -47,12 +65,14 @@ public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
   public init(
     storage: SyncStorage<Command, Response>, transport: SyncTransport<Command, Response>,
     didSync: @escaping @Sendable () async -> Void = {},
+    onFailure: @escaping @Sendable (SyncFailure) async -> Void = { _ in },
     sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
     now: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
   ) {
     self.storage = storage
     self.transport = transport
     self.didSync = didSync
+    self.onFailure = onFailure
     self.sleep = sleep
     self.now = now
   }
@@ -93,7 +113,8 @@ public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
 
   public func refresh() async throws -> Bool {
     if let running = task {
-      _ = try? await running.value
+      // A refresh makes a new attempt even when the preceding sync failed.
+      _ = await running.result
       if task == running { task = nil }
     }
     try Task.checkCancellation()
@@ -115,13 +136,15 @@ public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
     var failures = 0
     while scope.isActive, listenerID == id, !Task.isCancelled {
       var connectedAt: ContinuousClock.Instant?
+      var phase = SyncFailure.Phase.connecting
       do {
         let socket = try await open()
         defer { socket.close() }
         guard listenerID == id, !Task.isCancelled, scope.install(socket) else { continue }
         connectedAt = now()
+        phase = .receiving
         try await withTaskCancellationHandler {
-          _ = try? await refresh()
+          await refreshForListener(id)
           guard scope.isActive, listenerID == id, !Task.isCancelled else { return }
           let sleep = sleep
           try await withThrowingTaskGroup(of: Void.self) { group in
@@ -138,7 +161,7 @@ public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
             group.addTask {
               for try await message in socket.messages {
                 try Task.checkCancellation()
-                if message == "poke" { _ = try? await self.refresh() }
+                if message == "poke" { await self.refreshForListener(id) }
               }
             }
             try await group.next()
@@ -146,13 +169,34 @@ public actor SyncCoordinator<Command: SyncCommand, Response: Sendable> {
         } onCancel: {
           socket.close()
         }
-      } catch {}
+      } catch {
+        await report(error, phase: phase, listener: id)
+      }
       guard scope.isActive, listenerID == id, !Task.isCancelled else { continue }
       scope.closeSocket()
       if let connectedAt, connectedAt.duration(to: now()) >= .seconds(30) { failures = 0 }
       failures += 1
-      try? await sleep(.seconds(min(60, 1 << min(failures - 1, 6))))
+      do {
+        try await sleep(.seconds(min(60, 1 << min(failures - 1, 6))))
+      } catch {
+        await report(error, phase: .retrying, listener: id)
+        return
+      }
     }
+  }
+
+  private func refreshForListener(_ id: UUID) async {
+    guard scope.isActive, listenerID == id, !Task.isCancelled else { return }
+    do {
+      _ = try await refresh()
+    } catch {
+      await report(error, phase: .refreshing, listener: id)
+    }
+  }
+
+  private func report(_ error: any Error, phase: SyncFailure.Phase, listener id: UUID) async {
+    guard scope.isActive, listenerID == id, !Task.isCancelled else { return }
+    await onFailure(SyncFailure(phase: phase, error: error))
   }
 }
 

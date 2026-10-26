@@ -1,14 +1,23 @@
-name: Tests
+name: Checks
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   macos:
     runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
-      - run: swift test --jobs 4
+      - uses: jdx/mise-action@v2
+      - run: mise run check
   linux:
     runs-on: ubuntu-latest
     container: swift:6.2-jammy
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: apt-get update && apt-get install -y libsqlite3-dev
