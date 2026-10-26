@@ -51,3 +51,77 @@ func invalidationFencesDelayedPushAndPullResponses(duringPush: Bool) async throw
   #expect(writes.withLock { $0 } == (duringPush ? [] : ["sent"]))
   #expect(try await coordinator.sync() == false)
 }
+
+private enum ListenerFailure: Error { case refresh, retry }
+private enum ListenerEnd: CaseIterable, Equatable, Sendable {
+  case cancellation, failedSleep, invalidation
+}
+
+@Test(.timeLimit(.minutes(1)), arguments: ListenerEnd.allCases)
+private func listenerReportsFailuresAndStopsAfterCancellationOrFailedRetry(ending: ListenerEnd)
+  async throws
+{
+  let requested = AsyncStream<Void>.makeStream()
+  let response = AsyncStream<Void>.makeStream()
+  let retrying = AsyncStream<Void>.makeStream()
+  let retry = AsyncStream<Void>.makeStream()
+  let heartbeat = AsyncStream<Void>.makeStream()
+  let messages = AsyncThrowingStream<String, Error>.makeStream()
+  messages.continuation.finish()
+  let failures = Mutex<[SyncFailure.Phase]>([])
+  let socketClosed = Mutex(false)
+  let coordinator = SyncCoordinator(
+    storage: SyncStorage<Edit, Int>(
+      requests: {
+        (
+          OperationsRequest(clientID: "client", operations: []),
+          UpdatesRequest(clientID: "client", cookie: nil)
+        )
+      },
+      markSent: { _ in }, reconcile: { _ in }
+    ),
+    transport: SyncTransport(
+      push: { _ in },
+      pull: { _ in
+        requested.continuation.yield(())
+        for await _ in response.stream { break }
+        throw ListenerFailure.refresh
+      },
+      open: {
+        LiveConnection.Socket(
+          messages: messages.stream, send: { _ in },
+          close: { socketClosed.withLock { $0 = true } })
+      }
+    ),
+    onFailure: { failure in failures.withLock { $0.append(failure.phase) } },
+    sleep: { duration in
+      if duration == .seconds(30) {
+        for await _ in heartbeat.stream { break }
+        try Task.checkCancellation()
+        return
+      }
+      retrying.continuation.yield(())
+      for await _ in retry.stream { break }
+      try Task.checkCancellation()
+      throw ListenerFailure.retry
+    }
+  )
+  let listener = Task { await coordinator.listen() }
+  for await _ in requested.stream { break }
+  if ending == .invalidation { coordinator.invalidate() }
+  response.continuation.yield(())
+  if ending != .invalidation {
+    for await _ in retrying.stream { break }
+    if ending == .cancellation { listener.cancel() }
+    retry.continuation.yield(())
+  }
+  await listener.value
+  #expect(socketClosed.withLock { $0 })
+  let expected: [SyncFailure.Phase]
+  switch ending {
+  case .cancellation: expected = [.refreshing]
+  case .failedSleep: expected = [.refreshing, .retrying]
+  case .invalidation: expected = []
+  }
+  #expect(failures.withLock { $0 } == expected)
+}

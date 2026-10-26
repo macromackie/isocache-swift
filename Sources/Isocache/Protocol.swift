@@ -98,15 +98,47 @@ public struct Put<Entity: Codable & Sendable>: Codable, Sendable {
   }
 }
 
+public enum ReceiptStatus: Equatable, Sendable, Codable {
+  case rejected
+  case appliedWithNotice
+  case unknown(String)
+
+  public init(rawValue: String) {
+    switch rawValue {
+    case "rejected": self = .rejected
+    case "appliedWithNotice": self = .appliedWithNotice
+    default: self = .unknown(rawValue)
+    }
+  }
+
+  public var rawValue: String {
+    switch self {
+    case .rejected: "rejected"
+    case .appliedWithNotice: "appliedWithNotice"
+    case .unknown(let value): value
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.singleValueContainer()
+    try container.encode(rawValue)
+  }
+}
+
 public struct Receipt: Codable, Equatable, Sendable {
   public var sequence: Int
   public var error: String?
   public var id: String?
   public var code: String?
-  public var status: String?
+  public var status: ReceiptStatus?
 
   public init(
-    sequence: Int, error: String?, id: String? = nil, code: String? = nil, status: String? = nil
+    sequence: Int, error: String?, id: String? = nil, code: String? = nil,
+    status: ReceiptStatus? = nil
   ) {
     self.sequence = sequence
     self.error = error
