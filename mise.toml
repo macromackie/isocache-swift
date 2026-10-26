@@ -1,0 +1,9 @@
+[tools]
+"github:macromackie/tenet" = "0.10.0"
+
+[tasks."check:contracts"]
+run = "tenet validate"
+
+[tasks.check]
+depends = ["check:contracts"]
+run = "swift test --jobs 4"
